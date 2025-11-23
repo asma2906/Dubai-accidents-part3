@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Dubai Traffic Incidents — Accessible Linked D3 Dashboard</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+
+  <style>
+    body {
+      margin: 20px;
+      font-family: system-ui, "Segoe UI", sans-serif;
+      background: #fafafa;
+      color: #222;
+    }
+
+    h1 { margin-bottom: 4px; }
+    .instructions {
+      color: #555;
+      margin-bottom: 16px;
+      font-size: 0.95rem;
+    }
+
+    #resetBtn {
+      padding: 7px 14px;
+      background: #0072B2;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      margin-bottom: 14px;
+    }
+    #resetBtn:hover { background: #005f92; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 2fr 1.2fr;
+      grid-template-rows: auto auto;
+      gap: 18px;
+    }
+
+    .panel {
+      background: #fff;
+      border-radius: 6px;
+      box-shadow: 0 0 4px rgba(0,0,0,0.07);
+      padding: 12px 16px 10px;
+    }
+    .panel.full-width { grid-column: 1 / 3; }
+
+    svg { width: 100%; height: 320px; }
+    #dotmatrix { height: 260px; }
+
+    .axis path, .axis line { stroke: #ccc; }
+    .axis text { font-size: 10px; }
+
+    .area-layer { cursor: pointer; }
+    .donut-slice { cursor: pointer; }
+
+    .dot-cell-bg { fill: #efefef; }
+
+    #tooltip {
+      position: absolute;
+      background: #ffffff;
+      padding: 6px 10px;
+      border-radius: 6px;
+      box-shadow: 0 0 6px rgba(0,0,0,0.15);
+      font-size: 12px;
+      pointer-events: none;
+      display: none;
+    }
+
+    .no-data-text {
+      fill: #666;
+      font-size: 11px;
+    }
+  </style>
+</head>
+
+<body>
+
+<h1>Dubai Traffic Incidents</h1>
+<p class="instructions">
+  Brush a time range in the streamgraph (A). Click a donut slice (B).  
+  Dot-matrix (C) updates automatically. Hover for details.  
+  Colors use a fully color-blind–safe palette (Tol qualitative palette).
+</p>
+
+<button id="resetBtn">Reset Filters</button>
+
+<div id="tooltip"></div>
+
+<div class="layout">
+
+  <div class="panel">
+    <h2>A) Accident Types Over Time (Streamgraph)</h2>
+    <svg id="streamgraph"></svg>
+  </div>
+
+  <div class="panel">
+    <h2>B) Accident Type Distribution (Donut Chart)</h2>
+    <svg id="donut"></svg>
+  </div>
+
+  <div class="panel full-width">
+    <h2>C) Hour × Weekday (Dot-Matrix)</h2>
+    <svg id="dotmatrix"></svg>
+  </div>
+
+</div>
+
+
+<script>
+/* ============================================================
+   GLOBAL SETTINGS
+============================================================ */
+const csvFile = "accidents.csv";
+const topKTypes = 8;
+const parseDT = d3.timeParse("%d/%m/%Y %H:%M:%S");
+
+let selectedTimeRange = null;
+let selectedType = null;
+let globalBrush = null;
+
+let tooltip = d3.select("#tooltip");
+
+/* ============================================================
+   Fully Color-Blind Safe 12-Color Palette (Paul Tol)
+============================================================ */
+const safeColors = [
+  "#332288", "#88CCEE", "#44AA99", "#117733",
+  "#999933", "#DDCC77", "#CC6677", "#882255",
+  "#AA4499", "#DDDDDD", "#661100", "#6699CC"
+];
+
+/* ============================================================
+   LOAD & PROCESS DATA
+============================================================ */
+d3.csv(csvFile).then(raw => {
+
+  const data = raw.map(d => {
+    const dt = parseDT(d.acci_time);
+    if (!dt) return null;
+    return {
+      id: d.acci_id,
+      datetime: dt,
+      day: d3.timeDay(dt),
+      hour: dt.getHours(),
+      weekday: dt.getDay(),
+      type: d.acci_name,
+      lon: +d.acci_x,
+      lat: +d.acci_y
+    };
+  }).filter(d => d && !isNaN(d.lon) && !isNaN(d.lat));
+
+  const counts = Array.from(
+    d3.rollup(data, v=>v.length, d=>d.type),
+    ([type,count]) => ({type,count})
+  ).sort((a,b)=>d3.descending(a.count,b.count));
+
+  const topTypes = counts.slice(0, topKTypes).map(d => d.type);
+  const otherLabel = "Other / أخرى";
+
+  data.forEach(d =>
+    d.typeNorm = topTypes.includes(d.type) ? d.type : otherLabel
+  );
+
+  const allTypes = [...new Set(data.map(d => d.typeNorm))];
+
+  const color = d3.scaleOrdinal()
+    .domain(allTypes)
+    .range(safeColors);
+
+  buildStreamgraph(data, allTypes, color);
+  buildDonut(data, allTypes, color);
+  buildDotMatrix(data, allTypes, color);
+});
+
+/* ============================================================
+   STREAMGRAPH
+============================================================ */
+function buildStreamgraph(data, allTypes, color){
+
+  const svg=d3.select("#streamgraph");
+  const w=svg.node().getBoundingClientRect().width;
+  const h=svg.node().getBoundingClientRect().height;
+
+  const margin={top:20,right:10,bottom:32,left:45};
+  const innerW=w-margin.left-margin.right;
+  const innerH=h-margin.top-margin.bottom;
+
+  const g=svg.append("g")
+    .attr("transform",`translate(${margin.left},${margin.top})`);
+
+  const byDay=d3.rollup(
+    data,
+    v=>{ let c={}; allTypes.forEach(t=>c[t]=0); v.forEach(d=>c[d.typeNorm]++); return c; },
+    d=>d.day
+  );
+
+  const days=[...byDay.keys()].sort(d3.ascending);
+
+  const rows=days.map(day=>{
+    const r={day};
+    let c=byDay.get(day);
+    allTypes.forEach(t=>r[t]=c[t]);
+    return r;
+  });
+
+  const stack=d3.stack().keys(allTypes).offset(d3.stackOffsetWiggle);
+  const layers=stack(rows);
+
+  const x=d3.scaleTime().domain(d3.extent(days)).range([0,innerW]);
+  const y=d3.scaleLinear()
+    .domain([
+      d3.min(layers,L=>d3.min(L,d=>d[0])),
+      d3.max(layers,L=>d3.max(L,d=>d[1]))
+    ])
+    .range([innerH,0]);
+
+  const area=d3.area()
+    .x(d=>x(d.data.day))
+    .y0(d=>y(d[0]))
+    .y1(d=>y(d[1]));
+
+  const areaG=g.append("g");
+
+  areaG.selectAll("path")
+    .data(layers)
+    .join("path")
+    .attr("class","area-layer")
+    .attr("fill",d=>color(d.key))
+    .attr("d",area)
+    .attr("opacity",0.9)
+    .on("click",(evt,d)=>{
+      selectedType = (selectedType===d.key ? null : d.key);
+      updateDonut();
+      updateDotMatrix();
+      updateStreamHighlight(areaG);
+    });
+
+  g.append("g")
+    .attr("transform",`translate(0,${innerH})`)
+    .attr("class","axis")
+ .call(d3.axisBottom(x)
+      .ticks(10)
+      .tickFormat(d3.timeFormat("%b %Y")));
+
+
+
+  g.append("g")
+    .attr("class","axis")
+    .call(d3.axisLeft(y).ticks(4));
+
+  const brush=d3.brushX()
+    .extent([[0,0],[innerW,innerH]])
+    .on("end",({selection})=>{
+      if (!selection) selectedTimeRange=null;
+      else selectedTimeRange=selection.map(x.invert);
+      updateDonut();
+      updateDotMatrix();
+    });
+
+  globalBrush=brush;
+  g.append("g").attr("class","brush").call(brush);
+
+  window.updateStreamHighlight=function(){
+    areaG.selectAll("path")
+      .attr("opacity",d =>
+        selectedType && d.key!==selectedType ? 0.15 : 0.9
+      );
+  };
+}
+
+/* ============================================================
+   DONUT CHART (with hover tooltip added)
+============================================================ */
+let donutState=null;
+
+function buildDonut(data, allTypes, color){
+
+  const svg=d3.select("#donut");
+  const w=svg.node().getBoundingClientRect().width;
+  const h=svg.node().getBoundingClientRect().height;
+  const r=Math.min(w,h)/2 - 10;
+
+  const g=svg.append("g")
+    .attr("transform",`translate(${w/2},${h/2})`);
+
+  const arc=d3.arc().innerRadius(r*0.45).outerRadius(r);
+  const pie=d3.pie().sort(null).value(d=>d.count);
+
+  const txtMain=g.append("text")
+    .attr("text-anchor","middle")
+    .attr("y",-4)
+    .attr("font-weight","600");
+
+  const txtSub=g.append("text")
+    .attr("text-anchor","middle")
+    .attr("y",14)
+    .attr("fill","#555")
+    .attr("font-size","11px");
+
+  donutState={data, allTypes, color, arc, pie, g, txtMain, txtSub};
+
+  updateDonut();
+}
+
+
+function updateDonut(){
+  if (!donutState) return;
+
+  const {data, allTypes, color, arc, pie, g, txtMain, txtSub}=donutState;
+
+  let filtered=data;
+  if (selectedTimeRange){
+    const [t0,t1]=selectedTimeRange;
+    filtered=filtered.filter(d=>d.datetime>=t0 && d.datetime<=t1);
+  }
+
+  const counts=d3.rollup(filtered, v=>v.length, d=>d.typeNorm);
+  const pieData=[...counts].map(([type,count])=>({type,count}));
+
+  const slices=g.selectAll("path.donut-slice")
+    .data(pie(pieData), d=>d.data.type);
+
+  slices.join(
+    enter=>enter.append("path")
+      .attr("class","donut-slice")
+      .attr("fill",d=>color(d.data.type))
+      .attr("stroke","white")
+      .attr("stroke-width",1)
+      .attr("d",arc)
+      .attr("opacity",d =>
+        selectedType && d.data.type!==selectedType ? 0.3 : 1
+      )
+      .on("click",(evt,d)=>{
+        selectedType=(selectedType===d.data.type ? null : d.data.type);
+        updateDonut();
+        updateDotMatrix();
+        updateStreamHighlight();
+      })
+      /* ★ ADDED HOVER TOOLTIP */
+      .on("mousemove",(event,d)=>{
+        tooltip.style("display","block")
+          .style("left",(event.pageX+12)+"px")
+          .style("top",(event.pageY-10)+"px")
+          .html(`
+            <b>${d.data.type}</b><br>
+            ${d.data.count} incidents
+          `);
+      })
+      .on("mouseout",()=>tooltip.style("display","none")),
+      
+    update=>update
+      .attr("d",arc)
+      .attr("fill",d=>color(d.data.type))
+      .attr("opacity",d =>
+        selectedType && d.data.type!==selectedType ? 0.3 : 1
+      )
+      /* ★ HOVER FOR UPDATE SELECTION */
+      .on("mousemove",(event,d)=>{
+        tooltip.style("display","block")
+          .style("left",(event.pageX+12)+"px")
+          .style("top",(event.pageY-10)+"px")
+          .html(`
+            <b>${d.data.type}</b><br>
+            ${d.data.count} incidents
+          `);
+      })
+      .on("mouseout",()=>tooltip.style("display","none")),
+      
+    exit=>exit.remove()
+  );
+
+  if (!selectedType){
+    txtMain.text("All Types");
+    txtSub.text(d3.sum(pieData,d=>d.count)+" incidents");
+  } else {
+    const sel=pieData.find(x=>x.type===selectedType);
+    txtMain.text(sel.type);
+    txtSub.text(sel.count+" incidents");
+  }
+}
+
+/* ============================================================
+   DOT MATRIX
+============================================================ */
+let dotState=null;
+
+function buildDotMatrix(data, allTypes, color){
+
+  const svg=d3.select("#dotmatrix");
+  const w=svg.node().getBoundingClientRect().width;
+  const h=svg.node().getBoundingClientRect().height;
+
+  const margin={top:20,right:10,bottom:30,left:55};
+  const innerW=w-margin.left-margin.right;
+  const innerH=h-margin.top-margin.bottom;
+
+  const g=svg.append("g")
+    .attr("transform",`translate(${margin.left},${margin.top})`);
+
+  const hours=d3.range(24);
+  const weekdays=d3.range(7);
+  const weekdayNames=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+
+  const x=d3.scaleBand().domain(hours).range([0,innerW]).padding(0.1);
+  const y=d3.scaleBand().domain(weekdays).range([0,innerH]).padding(0.25);
+
+  g.selectAll("rect.dot-cell-bg")
+    .data(weekdays.flatMap(w => hours.map(h=>({w,h})) ))
+    .join("rect")
+    .attr("class","dot-cell-bg")
+    .attr("x",d=>x(d.h))
+    .attr("y",d=>y(d.w))
+    .attr("width",x.bandwidth())
+    .attr("height",y.bandwidth());
+
+  g.append("g")
+    .attr("transform",`translate(0,${innerH})`)
+    .attr("class","axis")
+    .call(
+      d3.axisBottom(x)
+        .tickValues([0,4,8,12,16,20])
+        .tickFormat(h=>`${String(h).padStart(2,"0")}:00`)
+    );
+
+  g.append("g")
+    .attr("class","axis")
+    .call(d3.axisLeft(y).tickFormat(d=>weekdayNames[d]));
+
+  const circlesG=g.append("g");
+  const msg=g.append("text")
+    .attr("class","no-data-text")
+    .attr("x",innerW/2)
+    .attr("y",innerH/2)
+    .attr("text-anchor","middle")
+    .style("display","none");
+
+  dotState={data, x, y, circlesG, msg, color};
+  updateDotMatrix();
+}
+
+
+function updateDotMatrix(){
+  if (!dotState) return;
+
+  const {data,x,y,circlesG,msg,color} = dotState;
+
+  let filtered=data;
+  if (selectedTimeRange){
+    const [t0,t1]=selectedTimeRange;
+    filtered=filtered.filter(d=>d.datetime>=t0 && d.datetime<=t1);
+  }
+  if (selectedType){
+    filtered=filtered.filter(d=>d.typeNorm===selectedType);
+  }
+
+  const totalCounts=d3.rollup(data, v=>v.length, d=>d.weekday, d=>d.hour);
+  const filteredCounts=d3.rollup(filtered, v=>v.length, d=>d.weekday, d=>d.hour);
+
+  const grid=[];
+  for (let w=0; w<7; w++){
+    for (let h=0; h<24; h++){
+      const total=totalCounts.get(w)?.get(h) || 0;
+      const filteredVal=filteredCounts.get(w)?.get(h) || 0;
+
+      grid.push({
+        w, h,
+        total,
+        filtered: filteredVal
+      });
+    }
+  }
+
+  const maxTotal=d3.max(grid,d=>d.total);
+  const baseR=d3.scaleSqrt().domain([0,maxTotal]).range([0, Math.min(x.bandwidth(), y.bandwidth())/1.9]);
+
+  const circles=circlesG.selectAll("circle").data(grid, d=>`${d.w}-${d.h}`);
+
+  circles.join(
+    enter => enter.append("circle")
+      .attr("cx",d=>x(d.h)+x.bandwidth()/2)
+      .attr("cy",d=>y(d.w)+y.bandwidth()/2)
+      .attr("r",0)
+      .attr("fill","#44AA99")
+      .attr("opacity",0.25)
+      .transition().duration(300)
+      .attr("r", d=> d.filtered>0 ? baseR(d.filtered) : baseR(d.total)/2)
+      .attr("opacity", d=> d.filtered>0 ? 1 : 0.3),
+
+    update => update.transition().duration(300)
+      .attr("r", d=> d.filtered>0 ? baseR(d.filtered) : baseR(d.total)/2)
+      .attr("opacity", d=> d.filtered>0 ? 1 : 0.3),
+
+    exit => exit.remove()
+  );
+
+  circles
+    .on("mousemove",(event,d)=>{
+      tooltip.style("display","block")
+        .style("left",(event.pageX+12)+"px")
+        .style("top",(event.pageY-10)+"px")
+        .html(`
+          <b>${d.filtered || d.total} accidents</b><br>
+          Hour: ${d.h}:00<br>
+          Day: ${["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.w]}
+        `);
+    })
+    .on("mouseout",()=>tooltip.style("display","none"));
+
+  if (filtered.length===0){
+    msg.text("No accidents match filters").style("display",null);
+  } else msg.style("display","none");
+}
+
+/* ============================================================
+   RESET BUTTON
+============================================================ */
+document.getElementById("resetBtn").addEventListener("click",()=>{
+  selectedType=null;
+  selectedTimeRange=null;
+
+  d3.select("#streamgraph").select(".brush")
+    .call(globalBrush.move, null);
+
+  updateDonut();
+  updateDotMatrix();
+  updateStreamHighlight();
+});
+</script>
+
+</body>
+</html>
+
+
+
+
+
